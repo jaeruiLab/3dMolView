@@ -1,0 +1,340 @@
+import { RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ExampleChips } from "./components/ExampleChips";
+import { MoleculeViewer, type MoleculeViewerHandle } from "./components/MoleculeViewer";
+import { PropertiesPanel } from "./components/PropertiesPanel";
+import { RecentSearches } from "./components/RecentSearches";
+import { SearchBar } from "./components/SearchBar";
+import { ShortcutsPopover } from "./components/ShortcutsPopover";
+import { BannerAction, StatusBanner } from "./components/StatusBanner";
+import { ThemeToggle } from "./components/ThemeToggle";
+import { STYLE_ORDER } from "./components/ViewerControls";
+import { useMolecule } from "./hooks/useMolecule";
+import { usePersistentState } from "./hooks/usePersistentState";
+import { useRecentSearches } from "./hooks/useRecentSearches";
+import { useTheme } from "./hooks/useTheme";
+import { resolveInputType } from "./lib/detectInput";
+import { isTypingTarget } from "./lib/shortcuts";
+import type { InputMode, Molecule, SearchRequest, ViewerSettings, ViewerStyle } from "./types";
+
+/** Viewer settings that survive reloads. Spin is per-session so the page never starts moving. */
+type PersistedSettings = Omit<ViewerSettings, "spin">;
+
+const DEFAULT_SETTINGS: PersistedSettings = { style: "ballstick", labels: false, surface: false };
+const DEFAULT_COMPOUND = "Caffeine";
+
+function isPersistedSettings(value: unknown): value is PersistedSettings {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    STYLE_ORDER.includes(v.style as ViewerStyle) && typeof v.labels === "boolean" && typeof v.surface === "boolean"
+  );
+}
+
+function parseMode(value: string | null): InputMode {
+  return value === "name" || value === "smiles" ? value : "auto";
+}
+
+type HistoryMode = "push" | "replace" | "none";
+
+/** Mirror the search in the URL (?q=…&mode=…) so it can be shared and navigated with Back. */
+function writeUrl(request: SearchRequest, history: HistoryMode): void {
+  if (history === "none") return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("q", request.query);
+  if (request.mode === "auto") url.searchParams.delete("mode");
+  else url.searchParams.set("mode", request.mode);
+  if (url.href === window.location.href) return;
+  if (history === "push") window.history.pushState(null, "", url);
+  else window.history.replaceState(null, "", url);
+}
+
+function readUrl(): { query: string; mode: InputMode } | null {
+  const params = new URLSearchParams(window.location.search);
+  const query = params.get("q")?.trim();
+  return query ? { query, mode: parseMode(params.get("mode")) } : null;
+}
+
+function LogoMark() {
+  return (
+    <svg aria-hidden viewBox="0 0 20 20" className="size-5 text-fg">
+      <path
+        d="M10 2.5 16.5 6.25v7.5L10 17.5l-6.5-3.75v-7.5z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <circle cx="10" cy="10" r="2" fill="currentColor" />
+    </svg>
+  );
+}
+
+export default function App() {
+  const { theme, toggle: toggleTheme } = useTheme();
+  const { state, search, retry, dismissError } = useMolecule();
+  const { items: recentItems, add: addRecent, clear: clearRecent } = useRecentSearches();
+
+  const [persisted, setPersisted] = usePersistentState("viewer-settings", DEFAULT_SETTINGS, isPersistedSettings);
+  const [spin, setSpin] = useState(false);
+  const settings = useMemo<ViewerSettings>(() => ({ ...persisted, spin }), [persisted, spin]);
+
+  const updateSettings = useCallback(
+    (patch: Partial<ViewerSettings>) => {
+      const { spin: nextSpin, ...rest } = patch;
+      if (nextSpin !== undefined) setSpin(nextSpin);
+      if (Object.keys(rest).length > 0) setPersisted((current) => ({ ...current, ...rest }));
+    },
+    [setPersisted],
+  );
+
+  const [input, setInput] = useState("");
+  const [mode, setMode] = useState<InputMode>("auto");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const viewerRef = useRef<MoleculeViewerHandle>(null);
+
+  const runSearch = useCallback(
+    (query: string, searchMode: InputMode, history: HistoryMode) => {
+      const trimmed = query.trim();
+      if (trimmed === "") {
+        searchInputRef.current?.focus();
+        return;
+      }
+      const request: SearchRequest = { query: trimmed, mode: searchMode, type: resolveInputType(trimmed, searchMode) };
+      setInput(trimmed);
+      setMode(searchMode);
+      search(request);
+      writeUrl(request, history);
+    },
+    [search],
+  );
+
+  // ── Initial load: ?q= from the URL, else the last search, else Caffeine ─────────
+  // Deliberately not guarded against StrictMode's double invocation: useMolecule aborts
+  // the first request during the simulated unmount, so it has to be issued again.
+  const firstRecent = useRef(recentItems[0]);
+  useEffect(() => {
+    const fromUrl = readUrl();
+    const fallback = firstRecent.current;
+    if (fromUrl) runSearch(fromUrl.query, fromUrl.mode, "replace");
+    else if (fallback) runSearch(fallback.query, fallback.mode, "replace");
+    else runSearch(DEFAULT_COMPOUND, "auto", "replace");
+  }, [runSearch]);
+
+  // Back/forward navigation re-runs the search in the URL.
+  useEffect(() => {
+    const onPopState = () => {
+      const fromUrl = readUrl();
+      if (fromUrl) runSearch(fromUrl.query, fromUrl.mode, "none");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [runSearch]);
+
+  // ── Side effects of state transitions: recent list and screen-reader announcement ──
+  const lastLoaded = useRef<Molecule | null>(null);
+  useEffect(() => {
+    if (state.status === "success" && state.molecule !== lastLoaded.current) {
+      const molecule = state.molecule;
+      lastLoaded.current = molecule;
+      addRecent({ query: molecule.request.query, mode: molecule.request.mode, label: molecule.name, cid: molecule.cid });
+      const formula = molecule.properties.molecularFormula;
+      setAnnouncement(
+        `Loaded ${molecule.name}${formula ? `, ${formula}` : ""}` +
+          (molecule.dimension === "2d" ? ". Showing 2D coordinates; no 3D conformer is available." : "."),
+      );
+    } else if (state.status === "error") {
+      setAnnouncement(state.error.title);
+    }
+  }, [state, addRecent]);
+
+  // ── Keyboard shortcuts (see lib/shortcuts.ts) ──────────────────────────────────
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (e.key === "Escape") {
+        if (shortcutsOpen) setShortcutsOpen(false);
+        else if (isTypingTarget(e.target)) (e.target as HTMLElement).blur();
+        return;
+      }
+      if (isTypingTarget(e.target)) return;
+
+      switch (e.key) {
+        case "/":
+          e.preventDefault();
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+          break;
+        case "?":
+          e.preventDefault();
+          setShortcutsOpen((open) => !open);
+          break;
+        case "r":
+        case "R":
+          viewerRef.current?.resetView();
+          break;
+        case "s":
+        case "S": {
+          const index = STYLE_ORDER.indexOf(settings.style);
+          const next = STYLE_ORDER[(index + 1) % STYLE_ORDER.length];
+          if (next) updateSettings({ style: next });
+          break;
+        }
+        case "l":
+        case "L":
+          updateSettings({ labels: !settings.labels });
+          break;
+        case "v":
+        case "V":
+          updateSettings({ surface: !settings.surface });
+          break;
+        case "a":
+        case "A":
+          updateSettings({ spin: !settings.spin });
+          break;
+        case "f":
+        case "F":
+          viewerRef.current?.toggleFullscreen();
+          break;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [settings, updateSettings, shortcutsOpen]);
+
+  // ── Derived view state ─────────────────────────────────────────────────────────
+  const loading = state.status === "loading";
+  const molecule = state.molecule;
+
+  let errorBanner = null;
+  if (state.status === "error") {
+    const { error, request } = state;
+    const canTryAsName = request.mode === "auto" && request.type === "smiles";
+    errorBanner = (
+      <StatusBanner
+        tone="error"
+        title={error.title}
+        detail={error.detail}
+        onDismiss={dismissError}
+        actions={
+          (error.suggestions?.length || error.retryable || canTryAsName) && (
+            <>
+              {error.suggestions && error.suggestions.length > 0 && (
+                <>
+                  <span className="text-xs text-muted">Did you mean</span>
+                  {error.suggestions.map((suggestion) => (
+                    <BannerAction key={suggestion} onClick={() => runSearch(suggestion, "auto", "push")}>
+                      {suggestion}
+                    </BannerAction>
+                  ))}
+                </>
+              )}
+              {error.retryable && (
+                <BannerAction onClick={retry}>
+                  <RefreshCw aria-hidden size={12} />
+                  Retry
+                </BannerAction>
+              )}
+              {canTryAsName && (
+                <BannerAction onClick={() => runSearch(request.query, "name", "push")}>Search as a name instead</BannerAction>
+              )}
+            </>
+          )
+        }
+      />
+    );
+  }
+
+  const showFlatWarning = !loading && molecule?.dimension === "2d";
+
+  return (
+    <div className="flex min-h-dvh flex-col lg:h-dvh">
+      <header className="app-header relative border-b border-line bg-panel px-4 py-2.5">
+        <div className="flex h-9 items-center gap-2 [grid-area:brand] pointer-coarse:h-11">
+          <LogoMark />
+          <h1 className="whitespace-nowrap text-base font-semibold text-fg">MolView 3D</h1>
+        </div>
+
+        <div className="min-w-0 [grid-area:form] lg:max-w-3xl">
+          <SearchBar
+            ref={searchInputRef}
+            value={input}
+            onValueChange={setInput}
+            mode={mode}
+            onModeChange={setMode}
+            onSubmit={() => runSearch(input, mode, "push")}
+          />
+        </div>
+
+        <div className="grid min-w-0 gap-y-1 [grid-area:strip] lg:grid-cols-2 lg:gap-x-6">
+          <ExampleChips onSelect={(name) => runSearch(name, "auto", "push")} />
+          <RecentSearches
+            items={recentItems}
+            onSelect={(item) => runSearch(item.query, item.mode, "push")}
+            onClear={clearRecent}
+          />
+        </div>
+
+        <div className="flex items-center gap-1 self-start [grid-area:actions]">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <ShortcutsPopover open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        </div>
+
+        {loading && (
+          <div role="progressbar" aria-label="Loading compound" className="progress-bar absolute inset-x-0 -bottom-px" />
+        )}
+      </header>
+
+      <main className="flex flex-1 flex-col gap-4 p-4 lg:min-h-0 lg:flex-row">
+        <section aria-label="Structure viewer" className="flex min-w-0 flex-col gap-2 lg:min-h-0 lg:flex-1">
+          {errorBanner}
+          {showFlatWarning && (
+            <StatusBanner
+              tone="warning"
+              title="No 3D conformer on PubChem. Showing 2D coordinates."
+              detail="PubChem does not compute 3D conformers for very large, flexible or multi-component compounds. Depth in this view is not meaningful."
+            />
+          )}
+          <div className="h-[60vh] min-h-80 lg:h-auto lg:min-h-0 lg:flex-1">
+            <ErrorBoundary area="3D viewer">
+              <MoleculeViewer
+                ref={viewerRef}
+                molecule={molecule}
+                loading={loading}
+                loadingStage={state.status === "loading" ? state.stage : null}
+                loadingQuery={state.status === "loading" ? state.request.query : null}
+                settings={settings}
+                onSettingsChange={updateSettings}
+                theme={theme}
+                onSelectExample={(name) => runSearch(name, "auto", "push")}
+              />
+            </ErrorBoundary>
+          </div>
+        </section>
+
+        <aside aria-label="Compound properties" className="lg:min-h-0 lg:w-[35%] lg:min-w-80 lg:max-w-[420px]">
+          <PropertiesPanel molecule={molecule} loading={loading} />
+        </aside>
+      </main>
+
+      <footer className="px-4 pb-3 text-xs text-muted">
+        Data:{" "}
+        <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" rel="noreferrer" className="rounded-ctl text-muted underline hover:text-fg">
+          PubChem
+        </a>{" "}
+        · Rendering:{" "}
+        <a href="https://3dmol.csb.pitt.edu/" target="_blank" rel="noreferrer" className="rounded-ctl text-muted underline hover:text-fg">
+          3Dmol.js
+        </a>
+      </footer>
+
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
+    </div>
+  );
+}
