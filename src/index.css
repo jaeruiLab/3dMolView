@@ -1,0 +1,243 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens: the single source of truth for both themes.
+ *
+ * Every color in the app (including the 3Dmol canvas background and atom-label
+ * colors, which are read from these variables at runtime) comes from here.
+ * Contrast notes (WCAG AA):
+ *   text / muted on page, panel and raised ≥ 4.5:1 in both themes
+ *   accent on panel ≥ 4.5:1 (used for links and active-state text)
+ *   on-accent on accent-solid ≥ 4.5:1 (primary button)
+ *   control-border on panel ≥ 3:1 (input boundaries)
+ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0f1115;
+  --panel: #161a20;
+  --raised: #1d222a;
+  --hover: #222831;
+  --border: #2a313b;
+  --control-border: #616c7c;
+  --text: #e6e9ee;
+  --muted: #9aa4b2;
+  --accent: #4c8dff;
+  --accent-solid: #2f6ae0;
+  --on-accent: #ffffff;
+  --warn: #e5a50a;
+  --danger: #f26b6b;
+  --canvas: #0b0d11;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f6f7f9;
+  --panel: #ffffff;
+  --raised: #f0f2f5;
+  --hover: #eceff3;
+  --border: #d9dee5;
+  --control-border: #858f9e;
+  --text: #14181f;
+  --muted: #5b6573;
+  --accent: #2563eb;
+  --accent-solid: #2563eb;
+  --on-accent: #ffffff;
+  --warn: #b45309;
+  --danger: #c62828;
+  /* Very light gray rather than pure white so white hydrogens stay visible. */
+  --canvas: #f3f5f8;
+}
+
+/* Remove Tailwind's default palette, radii and shadows so only tokens can be used. */
+@theme {
+  --color-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+  --text-*: initial;
+
+  /* Type scale: 12 / 14 / 16 / 20 only. */
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 22px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+
+  /* Exactly two radii in the whole app. */
+  --radius-ctl: 6px;
+  --radius-panel: 10px;
+
+  /* The single permitted shadow, for popovers and menus. */
+  --shadow-pop: 0 6px 20px rgb(0 0 0 / 0.18);
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-line: var(--border);
+  --color-control: var(--control-border);
+  --color-fg: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-solid: var(--accent-solid);
+  --color-on-accent: var(--on-accent);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-canvas: var(--canvas);
+}
+
+@layer base {
+  html {
+    background: var(--page);
+    color: var(--text);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 20px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+
+  /* One focus style everywhere: 2px accent ring, 2px offset. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  button {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: default;
+  }
+}
+
+@layer components {
+  /* 2px indeterminate progress bar under the header. */
+  .progress-bar {
+    position: relative;
+    height: 2px;
+    overflow: hidden;
+  }
+  .progress-bar::after {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 35%;
+    background: var(--accent);
+    animation: progress-slide 1.1s linear infinite;
+  }
+
+  /* Plain skeleton block: flat fill with a very slow opacity change. */
+  .skeleton {
+    background: var(--raised);
+    border-radius: var(--radius-ctl);
+    animation: skeleton-fade 2.4s ease-in-out infinite;
+  }
+
+  /*
+   * Header grid. DOM order is brand → search → examples/recent → theme/help so the tab
+   * order runs search → mode → examples; the grid puts theme/help in the top-right corner.
+   */
+  .app-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "brand actions"
+      "form form"
+      "strip strip";
+    column-gap: 16px;
+    row-gap: 8px;
+  }
+  @media (min-width: 1024px) {
+    .app-header {
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      grid-template-areas:
+        "brand form actions"
+        "strip strip strip";
+      column-gap: 24px;
+    }
+  }
+
+  /* 3Dmol appends its own <canvas>; keep it block-level so there is no baseline gap. */
+  .viewer-host canvas {
+    display: block;
+  }
+
+  /*
+   * Small icon buttons (copy, info, dismiss) keep a compact visual size but get a
+   * 44×44 px hit area on touch screens via an invisible pseudo-element.
+   */
+  .touch-target {
+    position: relative;
+  }
+  @media (pointer: coarse) {
+    .touch-target::before {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 44px;
+      height: 44px;
+      transform: translate(-50%, -50%);
+    }
+  }
+}
+
+@keyframes progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(290%);
+  }
+}
+
+@keyframes skeleton-fade {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  /* Without motion, show loading as a static full-width bar instead. */
+  .progress-bar::after {
+    width: 100%;
+    opacity: 0.7;
+  }
+}
