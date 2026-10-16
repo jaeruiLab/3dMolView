@@ -24,12 +24,15 @@ export type PubChemErrorKind =
 export class PubChemError extends Error {
   readonly kind: PubChemErrorKind;
   readonly status: number | undefined;
+  /** For "busy": seconds PubChem asked us to wait, when the Retry-After header is readable. */
+  readonly retryAfterSeconds: number | undefined;
 
-  constructor(kind: PubChemErrorKind, message: string, status?: number) {
+  constructor(kind: PubChemErrorKind, message: string, status?: number, retryAfterSeconds?: number) {
     super(message);
     this.name = "PubChemError";
     this.kind = kind;
     this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -51,12 +54,78 @@ interface RequestOptions {
   init?: RequestInit;
 }
 
+// ── Client-side rate limiting ────────────────────────────────────────────────────
+// PubChem allows at most 5 requests per second per client and answers bursts with
+// 503 ServerBusy, sometimes followed by a block lasting tens of seconds. Every request
+// in this module takes a slot first, so the app never sends more than that.
+const RATE_LIMIT = 5;
+/** Slightly longer than one second, for clock jitter between us and PubChem. */
+const RATE_WINDOW_MS = 1_100;
+/** Start times of the requests sent within the current window. */
+const recentStarts: number[] = [];
+
+/** Wait for `ms`, or reject with AbortedError as soon as `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new AbortedError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AbortedError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
- * fetch() with a timeout and a caller-provided cancel signal, mapping every failure mode
- * to PubChemError / AbortedError. Resolves only for 2xx responses.
+ * Resolve once a request may be sent without exceeding RATE_LIMIT per RATE_WINDOW_MS.
+ * Checking and claiming a slot happen in one synchronous step, so concurrent callers
+ * cannot claim the same slot. An aborted caller stops waiting and claims nothing.
  */
-async function request(url: string, { signal, timeoutMs = DEFAULT_TIMEOUT_MS, init }: RequestOptions = {}): Promise<Response> {
-  if (signal?.aborted) throw new AbortedError();
+async function acquireSlot(signal?: AbortSignal): Promise<void> {
+  for (;;) {
+    if (signal?.aborted) throw new AbortedError();
+    const now = Date.now();
+    while (recentStarts.length > 0 && now - (recentStarts[0] ?? 0) >= RATE_WINDOW_MS) recentStarts.shift();
+    if (recentStarts.length < RATE_LIMIT) {
+      recentStarts.push(now);
+      return;
+    }
+    await sleep(RATE_WINDOW_MS - (now - (recentStarts[0] ?? now)) + 10, signal);
+  }
+}
+
+/** Pause before the single automatic retry of a "busy" response. */
+const BUSY_RETRY_DELAY_MS = 2_000;
+
+/**
+ * Rate-limited fetch with one automatic retry for "busy" responses: a momentary
+ * overload usually clears within a couple of seconds. If the retry is also refused,
+ * the error reaches the UI.
+ */
+async function request(url: string, options: RequestOptions = {}): Promise<Response> {
+  try {
+    return await attempt(url, options);
+  } catch (error) {
+    if (!(error instanceof PubChemError) || error.kind !== "busy") throw error;
+    await sleep(BUSY_RETRY_DELAY_MS, options.signal);
+    return attempt(url, options);
+  }
+}
+
+/**
+ * One fetch() with a timeout and a caller-provided cancel signal, mapping every failure
+ * mode to PubChemError / AbortedError. Resolves only for 2xx responses. The timeout covers
+ * the network request only, not the wait for a rate-limit slot.
+ */
+async function attempt(url: string, { signal, timeoutMs = DEFAULT_TIMEOUT_MS, init }: RequestOptions): Promise<Response> {
+  await acquireSlot(signal);
 
   const controller = new AbortController();
   let timedOut = false;
@@ -88,7 +157,14 @@ async function request(url: string, { signal, timeoutMs = DEFAULT_TIMEOUT_MS, in
   if (status === 404) throw new PubChemError("not_found", detail ?? "Not found.", status);
   if (status === 400) throw new PubChemError("bad_request", detail ?? "Bad request.", status);
   if (status === 429 || status === 502 || status === 503 || status === 504) {
-    throw new PubChemError("busy", detail ?? "PubChem is busy.", status);
+    // Retry-After is only readable if PubChem exposes it via CORS; usually it does not.
+    const retryAfter = Number(response.headers.get("Retry-After"));
+    throw new PubChemError(
+      "busy",
+      detail ?? "PubChem is busy.",
+      status,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+    );
   }
   throw new PubChemError("http", detail ?? `HTTP ${status}`, status);
 }

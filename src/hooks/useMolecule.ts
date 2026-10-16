@@ -91,8 +91,17 @@ function toSearchError(error: unknown, request: SearchRequest): SearchError {
             detail: "Remove unusual characters and try again.",
             retryable: false,
           };
-    case "busy":
-      return { kind: "busy", title: "PubChem is busy, try again in a few seconds", retryable: true };
+    case "busy": {
+      // The client already retried once after a short pause, so this is a longer block.
+      // PubChem's Retry-After is normally 30 s but is rarely readable from the browser.
+      const wait = error.retryAfterSeconds ?? 30;
+      return {
+        kind: "busy",
+        title: `PubChem is busy, try again in about ${wait} seconds`,
+        detail: "PubChem limits how often it can be queried and is temporarily refusing requests.",
+        retryable: true,
+      };
+    }
     case "timeout":
       return { kind: "timeout", title: "Request timed out", detail: error.message, retryable: true };
     case "network":
