@@ -12,7 +12,7 @@ function isRecentSearch(value: unknown): value is RecentSearch {
     typeof v.query === "string" &&
     (v.mode === "auto" || v.mode === "name" || v.mode === "smiles") &&
     typeof v.label === "string" &&
-    typeof v.cid === "number"
+    typeof v.key === "string"
   );
 }
 
@@ -28,15 +28,16 @@ export interface UseRecentSearches {
 
 /**
  * Most-recent-first list of successful searches, persisted in localStorage.
- * Deduplicated by CID, so "aspirin" and its SMILES count as one entry (the newest wins).
+ * Deduplicated by `key` (the CID for PubChem results), so "aspirin" and its SMILES count
+ * as one entry (the newest wins).
  */
 export function useRecentSearches(): UseRecentSearches {
   const [items, setItems] = useState<RecentSearch[]>(() => readStorage(STORAGE_KEY, isRecentList) ?? []);
 
   const add = useCallback((entry: RecentSearch) => {
     setItems((current) => {
-      if (current[0]?.cid === entry.cid && current[0].query === entry.query) return current;
-      const next = [entry, ...current.filter((item) => item.cid !== entry.cid)].slice(0, MAX_RECENT);
+      if (current[0]?.key === entry.key && current[0].query === entry.query) return current;
+      const next = [entry, ...current.filter((item) => item.key !== entry.key)].slice(0, MAX_RECENT);
       writeStorage(STORAGE_KEY, next);
       return next;
     });

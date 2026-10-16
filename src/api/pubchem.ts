@@ -1,205 +1,85 @@
 /**
  * Typed client for the PubChem PUG REST API (https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest).
  *
- * Every function takes an AbortSignal so callers can cancel stale requests, and every
- * request has its own timeout. Failures are thrown as PubChemError with a `kind` that the
- * UI maps to a specific message; cancellations are thrown as AbortedError and should be
- * ignored by callers.
+ * Every function takes an AbortSignal so callers can cancel stale requests. Failures are
+ * thrown as ApiError (service "pubchem") with a `kind` the UI maps to a specific message;
+ * cancellations are thrown as AbortedError and should be ignored by callers.
+ *
+ * Politeness: requests are rate limited to PubChem's published 5 per second, a "busy"
+ * answer is retried once after a short pause, and if PubChem still refuses, the client
+ * stops contacting it for a cool-down period (so the app doesn't prolong a block) and
+ * callers fall back to other sources.
  */
 import type { CompoundProperties, StructureDimension } from "../types";
+import {
+  ApiError,
+  RateLimiter,
+  httpRequest,
+  isRecord,
+  readJson as readJsonFrom,
+  sleep,
+  type RequestOptions,
+  type ServiceConfig,
+} from "./http";
 
 const PUG = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
 const AUTOCOMPLETE = "https://pubchem.ncbi.nlm.nih.gov/rest/autocomplete/compound";
-export const DEFAULT_TIMEOUT_MS = 10_000;
 
-export type PubChemErrorKind =
-  | "not_found" // 404, or a SMILES that parses but matches no compound (CID 0)
-  | "bad_request" // 400: e.g. SMILES PubChem cannot parse
-  | "busy" // 429 / 503 / 502 / 504: throttled or overloaded
-  | "timeout" // our client-side timeout fired
-  | "network" // fetch rejected: offline, DNS, CORS-less error response
-  | "invalid_data" // response arrived but is not what we expected
-  | "http"; // any other non-OK status
-
-export class PubChemError extends Error {
-  readonly kind: PubChemErrorKind;
-  readonly status: number | undefined;
-  /** For "busy": seconds PubChem asked us to wait, when the Retry-After header is readable. */
-  readonly retryAfterSeconds: number | undefined;
-
-  constructor(kind: PubChemErrorKind, message: string, status?: number, retryAfterSeconds?: number) {
-    super(message);
-    this.name = "PubChemError";
-    this.kind = kind;
-    this.status = status;
-    this.retryAfterSeconds = retryAfterSeconds;
-  }
-}
-
-/** Thrown when the caller's signal aborted the request. Not an error from the user's point of view. */
-export class AbortedError extends Error {
-  constructor() {
-    super("Request was cancelled");
-    this.name = "AbortedError";
-  }
-}
-
-export function isAbortedError(error: unknown): error is AbortedError {
-  return error instanceof AbortedError;
-}
-
-interface RequestOptions {
-  signal?: AbortSignal;
-  timeoutMs?: number;
-  init?: RequestInit;
-}
-
-// ── Client-side rate limiting ────────────────────────────────────────────────────
-// PubChem allows at most 5 requests per second per client and answers bursts with
-// 503 ServerBusy, sometimes followed by a block lasting tens of seconds. Every request
-// in this module takes a slot first, so the app never sends more than that.
-const RATE_LIMIT = 5;
-/** Slightly longer than one second, for clock jitter between us and PubChem. */
-const RATE_WINDOW_MS = 1_100;
-/** Start times of the requests sent within the current window. */
-const recentStarts: number[] = [];
-
-/** Wait for `ms`, or reject with AbortedError as soon as `signal` aborts. */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new AbortedError());
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new AbortedError());
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-/**
- * Resolve once a request may be sent without exceeding RATE_LIMIT per RATE_WINDOW_MS.
- * Checking and claiming a slot happen in one synchronous step, so concurrent callers
- * cannot claim the same slot. An aborted caller stops waiting and claims nothing.
- */
-async function acquireSlot(signal?: AbortSignal): Promise<void> {
-  for (;;) {
-    if (signal?.aborted) throw new AbortedError();
-    const now = Date.now();
-    while (recentStarts.length > 0 && now - (recentStarts[0] ?? 0) >= RATE_WINDOW_MS) recentStarts.shift();
-    if (recentStarts.length < RATE_LIMIT) {
-      recentStarts.push(now);
-      return;
-    }
-    await sleep(RATE_WINDOW_MS - (now - (recentStarts[0] ?? now)) + 10, signal);
-  }
-}
+const PUBCHEM: ServiceConfig = {
+  service: "pubchem",
+  label: "PubChem",
+  // 5 per second, with a slightly longer window for clock jitter between us and PubChem.
+  limiter: new RateLimiter(5, 1_100),
+  timeoutMs: 10_000,
+};
 
 /** Pause before the single automatic retry of a "busy" response. */
 const BUSY_RETRY_DELAY_MS = 2_000;
+/** Cool-down after PubChem refuses twice, when it doesn't tell us how long (its usual value). */
+const DEFAULT_COOLDOWN_S = 30;
+
+let cooldownUntil = 0;
+
+/** Seconds until PubChem will be contacted again, or 0 if it is not cooling down. */
+export function pubchemCooldownRemaining(): number {
+  return Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000));
+}
 
 /**
- * Rate-limited fetch with one automatic retry for "busy" responses: a momentary
+ * Rate-limited request with one automatic retry for "busy" responses: a momentary
  * overload usually clears within a couple of seconds. If the retry is also refused,
- * the error reaches the UI.
+ * PubChem enters a cool-down during which requests fail immediately without being sent.
  */
 async function request(url: string, options: RequestOptions = {}): Promise<Response> {
+  const remaining = pubchemCooldownRemaining();
+  if (remaining > 0) {
+    throw new ApiError("busy", "pubchem", "PubChem is cooling down after refusing requests.", {
+      retryAfterSeconds: remaining,
+    });
+  }
   try {
-    return await attempt(url, options);
+    return await httpRequest(PUBCHEM, url, options);
   } catch (error) {
-    if (!(error instanceof PubChemError) || error.kind !== "busy") throw error;
+    if (!(error instanceof ApiError) || error.kind !== "busy") throw error;
     await sleep(BUSY_RETRY_DELAY_MS, options.signal);
-    return attempt(url, options);
-  }
-}
-
-/**
- * One fetch() with a timeout and a caller-provided cancel signal, mapping every failure
- * mode to PubChemError / AbortedError. Resolves only for 2xx responses. The timeout covers
- * the network request only, not the wait for a rate-limit slot.
- */
-async function attempt(url: string, { signal, timeoutMs = DEFAULT_TIMEOUT_MS, init }: RequestOptions): Promise<Response> {
-  await acquireSlot(signal);
-
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = window.setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
-
-  let response: Response;
-  try {
-    response = await fetch(url, { ...init, signal: controller.signal });
-  } catch (error) {
-    if (timedOut) throw new PubChemError("timeout", `PubChem did not respond within ${timeoutMs / 1000} s.`);
-    if (signal?.aborted) throw new AbortedError();
-    // fetch rejects with TypeError for network failures. PubChem's 503 pages sometimes
-    // omit CORS headers, which also surfaces here; the message covers both.
-    throw new PubChemError("network", error instanceof Error ? error.message : "Network request failed.");
-  } finally {
-    window.clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-
-  if (response.ok) return response;
-
-  const detail = await readFaultMessage(response);
-  const status = response.status;
-  if (status === 404) throw new PubChemError("not_found", detail ?? "Not found.", status);
-  if (status === 400) throw new PubChemError("bad_request", detail ?? "Bad request.", status);
-  if (status === 429 || status === 502 || status === 503 || status === 504) {
-    // Retry-After is only readable if PubChem exposes it via CORS; usually it does not.
-    const retryAfter = Number(response.headers.get("Retry-After"));
-    throw new PubChemError(
-      "busy",
-      detail ?? "PubChem is busy.",
-      status,
-      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
-    );
-  }
-  throw new PubChemError("http", detail ?? `HTTP ${status}`, status);
-}
-
-/** PUG REST errors carry `{ Fault: { Code, Message, Details } }`; extract the message if present. */
-async function readFaultMessage(response: Response): Promise<string | null> {
-  try {
-    const body: unknown = await response.json();
-    const fault = isRecord(body) && isRecord(body.Fault) ? body.Fault : null;
-    if (fault && typeof fault.Message === "string") {
-      const details = Array.isArray(fault.Details) ? fault.Details.filter((d) => typeof d === "string") : [];
-      return [fault.Message, ...details].join(" ");
+    try {
+      return await httpRequest(PUBCHEM, url, options);
+    } catch (retryError) {
+      if (retryError instanceof ApiError && retryError.kind === "busy") {
+        const seconds = retryError.retryAfterSeconds ?? DEFAULT_COOLDOWN_S;
+        cooldownUntil = Math.max(cooldownUntil, Date.now() + seconds * 1000);
+      }
+      throw retryError;
     }
-  } catch {
-    // Body was not JSON; fall back to the generic message.
-  }
-  return null;
-}
-
-async function readJson(response: Response): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    throw new PubChemError("invalid_data", "PubChem returned a response that is not valid JSON.");
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const readJson = (response: Response) => readJsonFrom(response, "pubchem");
 
 /** Extract the CID list from `{ IdentifierList: { CID: [...] } }`. */
 function parseCidList(body: unknown): number[] {
   const list = isRecord(body) && isRecord(body.IdentifierList) ? body.IdentifierList.CID : null;
-  if (!Array.isArray(list)) throw new PubChemError("invalid_data", "PubChem returned no identifier list.");
+  if (!Array.isArray(list)) throw new ApiError("invalid_data", "pubchem", "PubChem returned no identifier list.");
   return list.filter((cid): cid is number => typeof cid === "number" && Number.isInteger(cid));
 }
 
@@ -208,7 +88,7 @@ export async function fetchCidByName(name: string, signal?: AbortSignal): Promis
   const url = `${PUG}/compound/name/${encodeURIComponent(name)}/cids/JSON`;
   const cids = parseCidList(await readJson(await request(url, { signal })));
   const cid = cids[0];
-  if (cid === undefined || cid <= 0) throw new PubChemError("not_found", `No CID for "${name}".`);
+  if (cid === undefined || cid <= 0) throw new ApiError("not_found", "pubchem", `No CID for "${name}".`);
   return cid;
 }
 
@@ -228,7 +108,7 @@ export async function fetchCidBySmiles(smiles: string, signal?: AbortSignal): Pr
   });
   const cids = parseCidList(await readJson(response));
   const cid = cids[0];
-  if (cid === undefined || cid <= 0) throw new PubChemError("not_found", "No compound matches this structure.");
+  if (cid === undefined || cid <= 0) throw new ApiError("not_found", "pubchem", "No compound matches this structure.");
   return cid;
 }
 
@@ -246,7 +126,7 @@ export async function fetchStructure(cid: number, signal?: AbortSignal): Promise
   try {
     return { sdf: await fetchSdf(cid, "3d", signal), dimension: "3d" };
   } catch (error) {
-    if (error instanceof PubChemError && error.kind === "not_found") {
+    if (error instanceof ApiError && error.kind === "not_found") {
       return { sdf: await fetchSdf(cid, "2d", signal), dimension: "2d" };
     }
     throw error;
@@ -257,7 +137,7 @@ async function fetchSdf(cid: number, recordType: StructureDimension, signal?: Ab
   const response = await request(`${PUG}/compound/cid/${cid}/record/SDF?record_type=${recordType}`, { signal });
   const text = await response.text();
   if (!text.includes("M  END")) {
-    throw new PubChemError("invalid_data", `PubChem returned an empty or invalid ${recordType.toUpperCase()} SDF.`);
+    throw new ApiError("invalid_data", "pubchem", `PubChem returned an empty or invalid ${recordType.toUpperCase()} SDF.`);
   }
   return text;
 }
@@ -292,7 +172,7 @@ export async function fetchProperties(cid: number, signal?: AbortSignal): Promis
   } catch (error) {
     // A mirror or older deployment that does not know "SMILES"/"ConnectivitySMILES"
     // answers 400 for the whole request; retry once with the legacy names.
-    if (error instanceof PubChemError && error.kind === "bad_request") {
+    if (error instanceof ApiError && error.kind === "bad_request") {
       response = await request(url(LEGACY_PROPERTY_FIELDS), { signal });
     } else {
       throw error;
@@ -302,7 +182,7 @@ export async function fetchProperties(cid: number, signal?: AbortSignal): Promis
   const body = await readJson(response);
   const table = isRecord(body) && isRecord(body.PropertyTable) ? body.PropertyTable.Properties : null;
   const row: unknown = Array.isArray(table) ? table[0] : null;
-  if (!isRecord(row)) throw new PubChemError("invalid_data", "PubChem returned no properties.");
+  if (!isRecord(row)) throw new ApiError("invalid_data", "pubchem", "PubChem returned no properties.");
   return normalizeProperties(cid, row);
 }
 
@@ -331,7 +211,8 @@ function normalizeProperties(cid: number, row: Record<string, unknown>): Compoun
     // Current names first, then the pre-2025 names for the same values.
     smiles: toText(row.SMILES) ?? toText(row.IsomericSMILES),
     connectivitySmiles: toText(row.ConnectivitySMILES) ?? toText(row.CanonicalSMILES),
-    xlogp: toNumber(row.XLogP),
+    logP: toNumber(row.XLogP),
+    logPMethod: "XLogP3",
     tpsa: toNumber(row.TPSA),
     hBondDonors: toNumber(row.HBondDonorCount),
     hBondAcceptors: toNumber(row.HBondAcceptorCount),

@@ -1,5 +1,5 @@
 import * as $3Dmol from "3dmol";
-import { AlertTriangle, Box, X } from "lucide-react";
+import { AlertTriangle, Box, Cpu, Server, X } from "lucide-react";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { downloadUrl } from "../lib/clipboard";
 import { getElementInfo } from "../lib/elementColors";
@@ -274,10 +274,15 @@ export const MoleculeViewer = forwardRef<MoleculeViewerHandle, MoleculeViewerPro
       `${formula ? `, ${formula}` : ""}, ${molecule.atomCount} atoms, shown as ${STYLE_LABELS[settings.style].toLowerCase()}.`
     : "Molecule viewer, no compound loaded.";
 
+  const shortQuery = loadingQuery && loadingQuery.length > 40 ? `${loadingQuery.slice(0, 40)}…` : loadingQuery;
   const stageText =
-    loadingStage === "resolving" && loadingQuery
-      ? `Resolving “${loadingQuery.length > 40 ? `${loadingQuery.slice(0, 40)}…` : loadingQuery}”`
-      : "Fetching structure and properties";
+    loadingStage === "fallback"
+      ? "PubChem unavailable, asking NCI CACTUS"
+      : loadingStage === "computing"
+        ? "Computing 3D structure in your browser"
+        : loadingStage === "resolving" && shortQuery
+          ? `Resolving “${shortQuery}”`
+          : "Fetching structure and properties";
 
   const hint = coarsePointer
     ? "Drag: rotate · Pinch: zoom · Two-finger drag: pan"
@@ -314,6 +319,16 @@ export const MoleculeViewer = forwardRef<MoleculeViewerHandle, MoleculeViewerPro
           <div className="pointer-events-none absolute left-3 top-3 flex max-w-[calc(100%-1.5rem)] items-center gap-1.5 rounded-ctl border border-line bg-panel px-2 py-1 text-xs text-fg">
             {loading ? (
               <span>{stageText}…</span>
+            ) : molecule?.source === "cactus" ? (
+              <>
+                <Server aria-hidden size={13} className="shrink-0 text-muted" />
+                <span>3D model · NCI CACTUS (computed)</span>
+              </>
+            ) : molecule?.source === "local" ? (
+              <>
+                <Cpu aria-hidden size={13} className="shrink-0 text-muted" />
+                <span>3D model · computed in your browser</span>
+              </>
             ) : molecule?.dimension === "3d" ? (
               <>
                 <Box aria-hidden size={13} className="shrink-0 text-muted" />

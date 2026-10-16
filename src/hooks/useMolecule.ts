@@ -1,17 +1,8 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import {
-  PubChemError,
-  fetchCidByName,
-  fetchCidBySmiles,
-  fetchNameSuggestions,
-  fetchProperties,
-  fetchStructure,
-  fetchSynonyms,
-  isAbortedError,
-} from "../api/pubchem";
-import { summarizeSdf } from "../lib/sdf";
+import { ApiError, isAbortedError } from "../api/http";
+import { fetchNameSuggestions } from "../api/pubchem";
+import { resolveMolecule } from "../api/resolveMolecule";
 import { editDistance, isPlausibleCorrection } from "../lib/similarity";
-import { titleCase } from "../lib/format";
 import type { LoadStage, Molecule, SearchError, SearchRequest } from "../types";
 
 /**
@@ -58,12 +49,22 @@ function reducer(state: MoleculeState, action: Action): MoleculeState {
 
 /** Translate a low-level failure into a specific, user-facing message. */
 function toSearchError(error: unknown, request: SearchRequest): SearchError {
-  if (!(error instanceof PubChemError)) {
+  if (!(error instanceof ApiError)) {
     return { kind: "http", title: "Something went wrong while loading this compound", retryable: true };
   }
   const isSmiles = request.type === "smiles";
+  const source = error.service === "cactus" ? "NCI CACTUS" : "PubChem";
+
   switch (error.kind) {
     case "not_found":
+      if (error.service === "cactus") {
+        return {
+          kind: "not_found",
+          title: `No compound found for "${request.query}"`,
+          detail: "PubChem is unavailable right now, and NCI CACTUS has no match either. Check the spelling, or search by SMILES.",
+          retryable: true,
+        };
+      }
       return isSmiles
         ? {
             kind: "not_found",
@@ -81,13 +82,13 @@ function toSearchError(error: unknown, request: SearchRequest): SearchError {
       return isSmiles
         ? {
             kind: "bad_input",
-            title: "SMILES could not be parsed by PubChem",
+            title: error.service === "local" ? "SMILES could not be parsed" : "SMILES could not be parsed by PubChem",
             detail: "Check ring-closure digits, brackets and charges.",
             retryable: false,
           }
         : {
             kind: "bad_input",
-            title: `PubChem could not interpret "${request.query}"`,
+            title: `${source} could not interpret "${request.query}"`,
             detail: "Remove unusual characters and try again.",
             retryable: false,
           };
@@ -97,8 +98,8 @@ function toSearchError(error: unknown, request: SearchRequest): SearchError {
       const wait = error.retryAfterSeconds ?? 30;
       return {
         kind: "busy",
-        title: `PubChem is busy, try again in about ${wait} seconds`,
-        detail: "PubChem limits how often it can be queried and is temporarily refusing requests.",
+        title: `${source} is busy, try again in about ${wait} seconds`,
+        detail: `${source} limits how often it can be queried and is temporarily refusing requests.`,
         retryable: true,
       };
     }
@@ -107,66 +108,26 @@ function toSearchError(error: unknown, request: SearchRequest): SearchError {
     case "network":
       return {
         kind: "network",
-        title: "Could not reach PubChem",
-        detail: "Check your connection. PubChem may also be briefly unavailable.",
+        title: `Could not reach ${source}`,
+        detail: "Check your connection. The service may also be briefly unavailable.",
         retryable: true,
       };
     case "invalid_data":
-      return { kind: "invalid_data", title: "PubChem returned unusable data", detail: error.message, retryable: true };
+      return error.service === "local"
+        ? {
+            kind: "invalid_data",
+            title: "Could not compute a 3D structure for this SMILES",
+            detail: error.message,
+            retryable: false,
+          }
+        : { kind: "invalid_data", title: `${source} returned unusable data`, detail: error.message, retryable: true };
     case "http":
       return {
         kind: "http",
-        title: `PubChem returned an unexpected error${error.status ? ` (HTTP ${error.status})` : ""}`,
+        title: `${source} returned an unexpected error${error.status ? ` (HTTP ${error.status})` : ""}`,
         retryable: true,
       };
   }
-}
-
-/** Pick the display name: PubChem's title, else the searched name, else the CID. */
-function displayName(title: string | null, request: SearchRequest, cid: number): string {
-  if (title) return title.charAt(0).toUpperCase() + title.slice(1);
-  if (request.type === "name") return titleCase(request.query);
-  return `CID ${cid}`;
-}
-
-async function loadMolecule(
-  request: SearchRequest,
-  signal: AbortSignal,
-  onStage: (stage: LoadStage) => void,
-): Promise<Molecule> {
-  const cid =
-    request.type === "smiles"
-      ? await fetchCidBySmiles(request.query, signal)
-      : await fetchCidByName(request.query, signal);
-
-  onStage("fetching");
-  const [structure, properties, synonyms] = await Promise.all([
-    fetchStructure(cid, signal),
-    fetchProperties(cid, signal),
-    // Synonyms are nice to have; never fail the whole search because of them.
-    fetchSynonyms(cid, signal).catch((error: unknown) => {
-      if (isAbortedError(error)) throw error;
-      return [] as string[];
-    }),
-  ]);
-
-  const summary = summarizeSdf(structure.sdf);
-  if (!summary) {
-    throw new PubChemError("invalid_data", `The structure record for CID ${cid} contains no atoms.`);
-  }
-
-  return {
-    request,
-    cid,
-    name: displayName(properties.title, request, cid),
-    sdf: structure.sdf,
-    dimension: structure.dimension,
-    properties,
-    synonyms,
-    atomCount: summary.atomCount,
-    elements: summary.elements,
-    retrievedAt: new Date(),
-  };
 }
 
 /**
@@ -219,7 +180,7 @@ export function useMolecule(): UseMolecule {
 
     dispatch({ type: "start", request });
 
-    loadMolecule(request, signal, (stage) => {
+    resolveMolecule(request, signal, (stage) => {
       if (!signal.aborted) dispatch({ type: "stage", stage });
     })
       .then((molecule) => {
@@ -230,8 +191,10 @@ export function useMolecule(): UseMolecule {
         const searchError = toSearchError(error, request);
         dispatch({ type: "error", error: searchError });
 
-        // Offer "Did you mean…" for unknown names. Best effort, same cancel signal.
-        if (searchError.kind === "not_found" && request.type === "name") {
+        // Offer "Did you mean…" for names PubChem doesn't know. Skipped when PubChem was
+        // unavailable (the not-found answer came from CACTUS) to avoid adding to its load.
+        const fromPubChem = error instanceof ApiError && error.service === "pubchem";
+        if (searchError.kind === "not_found" && request.type === "name" && fromPubChem) {
           suggestCorrections(request.query, signal)
             .then((suggestions) => {
               if (!signal.aborted) dispatch({ type: "suggestions", suggestions });

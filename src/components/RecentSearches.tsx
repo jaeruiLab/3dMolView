@@ -27,7 +27,7 @@ export function RecentSearches({ items, onSelect, onClear }: RecentSearchesProps
     >
       {items.map((item) => (
         <button
-          key={`${item.cid}-${item.query}`}
+          key={`${item.key}-${item.query}`}
           type="button"
           className={chipClass}
           title={item.query === item.label ? undefined : `Searched: ${item.query}`}

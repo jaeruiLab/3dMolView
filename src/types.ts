@@ -13,9 +13,10 @@ export interface SearchRequest {
   type: InputType;
 }
 
-/** Normalized subset of PubChem's computed properties. Missing values are `null`. */
+/** Normalized compound properties from any source. Missing values are `null`. */
 export interface CompoundProperties {
-  cid: number;
+  /** PubChem CID; null for structures that did not come from PubChem. */
+  cid: number | null;
   title: string | null;
   molecularFormula: string | null;
   molecularWeight: number | null;
@@ -25,7 +26,9 @@ export interface CompoundProperties {
   smiles: string | null;
   /** SMILES without stereo/isotopes (PubChem "ConnectivitySMILES", formerly "CanonicalSMILES"). */
   connectivitySmiles: string | null;
-  xlogp: number | null;
+  logP: number | null;
+  /** PubChem reports XLogP3; in-browser computation (OpenChemLib) reports cLogP. */
+  logPMethod: "XLogP3" | "cLogP";
   tpsa: number | null;
   hBondDonors: number | null;
   hBondAcceptors: number | null;
@@ -33,14 +36,27 @@ export interface CompoundProperties {
   complexity: number | null;
 }
 
-/** Which coordinates PubChem supplied for the structure. */
+/** Which coordinates the structure has. */
 export type StructureDimension = "3d" | "2d";
+
+/**
+ * Where the structure came from: PubChem's database, NCI CACTUS (3D generated on their
+ * server), or computed in the browser from SMILES with OpenChemLib.
+ */
+export type DataSource = "pubchem" | "cactus" | "local";
+
+/** Why a non-PubChem source was used. */
+export type FallbackReason = "pubchem-unavailable" | "not-in-pubchem";
 
 export interface Molecule {
   /** The search that produced this molecule. */
   request: SearchRequest;
-  cid: number;
-  /** Display name: PubChem title, else the searched name, else "CID n". */
+  source: DataSource;
+  /** Null when the structure came from PubChem itself. */
+  fallback: FallbackReason | null;
+  /** PubChem CID; null for CACTUS and in-browser structures. */
+  cid: number | null;
+  /** Display name: PubChem title, else the searched name, else "CID n" / "Unnamed structure". */
   name: string;
   sdf: string;
   dimension: StructureDimension;
@@ -83,14 +99,19 @@ export interface SearchError {
   suggestions?: string[];
 }
 
-export type LoadStage = "resolving" | "fetching";
+/**
+ * resolving: looking up the identifier on PubChem · fetching: structure and properties
+ * fallback: PubChem unavailable, asking NCI CACTUS · computing: building 3D in the browser
+ */
+export type LoadStage = "resolving" | "fetching" | "fallback" | "computing";
 
 export interface RecentSearch {
   query: string;
   mode: InputMode;
   /** Resolved compound name shown on the button. */
   label: string;
-  cid: number;
+  /** Identity used for de-duplication: "cid:2519", or source + query for non-PubChem results. */
+  key: string;
 }
 
 export type Theme = "dark" | "light";

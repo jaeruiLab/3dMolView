@@ -1,5 +1,6 @@
 import { ExternalLink } from "lucide-react";
 import { useId, type ReactNode } from "react";
+import { CACTUS_HOME } from "../api/cactus";
 import { compoundPageUrl } from "../api/pubchem";
 import { formatFixed, formatInteger, formatTimestamp, titleCase } from "../lib/format";
 import type { Molecule } from "../types";
@@ -10,7 +11,8 @@ import { InfoTip } from "./ui/InfoTip";
 /** Plain-language definitions for non-obvious properties. */
 const DEFINITIONS = {
   exactMass: "Mass of one molecule with its most likely isotopic composition, as measured in mass spectrometry.",
-  xlogp: "Predicted octanol–water partition coefficient (log scale); higher values mean more fat-soluble.",
+  xlogp: "Predicted octanol–water partition coefficient (log scale, PubChem's XLogP3); higher values mean more fat-soluble.",
+  clogp: "Predicted octanol–water partition coefficient (log scale, OpenChemLib's cLogP); higher values mean more fat-soluble.",
   tpsa: "Topological polar surface area: the surface of polar atoms, often used to predict membrane permeability.",
   rotatableBonds: "Count of single, non-ring bonds between heavy atoms that can freely rotate; a measure of flexibility.",
   complexity: "PubChem's score for how structurally intricate the molecule is, based on its elements and bonding.",
@@ -58,14 +60,16 @@ function PanelSkeleton() {
 
 function PanelContent({ molecule }: { molecule: Molecule }) {
   const p = molecule.properties;
-  const lowerName = molecule.name.toLowerCase();
-  const synonyms = molecule.synonyms.filter((s) => s.toLowerCase() !== lowerName).slice(0, SYNONYM_LIMIT);
+  // Skip names already shown in the header.
+  const shown = new Set([molecule.name.toLowerCase(), (p.iupacName ?? "").toLowerCase()]);
+  const synonyms = molecule.synonyms.filter((s) => !shown.has(s.toLowerCase())).slice(0, SYNONYM_LIMIT);
   const showConnectivity = p.connectivitySmiles !== null && p.connectivitySmiles !== p.smiles;
 
   return (
     <article aria-label={`Properties of ${molecule.name}`}>
       <header className="border-b border-line px-4 pb-3 pt-4">
-        <h2 className="text-base font-semibold text-fg [overflow-wrap:anywhere]">{titleCase(molecule.name)}</h2>
+        <h2 className="text-base font-semibold text-fg [overflow-wrap:anywhere]">{molecule.source === "local" ? molecule.name : titleCase(molecule.name)}
+        </h2>
         {p.iupacName && (
           <p className="mt-1 font-mono text-xs text-muted [overflow-wrap:anywhere]">
             <span className="sr-only">IUPAC name: </span>
@@ -80,9 +84,11 @@ function PanelContent({ molecule }: { molecule: Molecule }) {
         </Row>
         <CodeRow label="SMILES" value={p.smiles} />
         {showConnectivity && <CodeRow label="Connectivity SMILES" value={p.connectivitySmiles} />}
-        <Row label="PubChem CID" action={<CopyButton value={String(molecule.cid)} subject="CID" />}>
-          <span className="font-mono tabular-nums">{molecule.cid}</span>
-        </Row>
+        {molecule.cid !== null && (
+          <Row label="PubChem CID" action={<CopyButton value={String(molecule.cid)} subject="CID" />}>
+            <span className="font-mono tabular-nums">{molecule.cid}</span>
+          </Row>
+        )}
       </Section>
 
       <Section title="Mass">
@@ -95,8 +101,17 @@ function PanelContent({ molecule }: { molecule: Molecule }) {
       </Section>
 
       <Section title="Physicochemical">
-        <Row label="XLogP" info={DEFINITIONS.xlogp}>
-          <Numeric value={formatFixed(p.xlogp, 1)} />
+        {molecule.source !== "pubchem" && (
+          <p className="pt-1 text-xs text-muted">
+            Computed in your browser with OpenChemLib. Definitions differ slightly from PubChem&rsquo;s, so values
+            (especially acceptor counts) may not match.
+          </p>
+        )}
+        <Row
+          label={p.logPMethod === "XLogP3" ? "XLogP" : "cLogP"}
+          info={p.logPMethod === "XLogP3" ? DEFINITIONS.xlogp : DEFINITIONS.clogp}
+        >
+          <Numeric value={formatFixed(p.logP, 1)} />
         </Row>
         <Row label="TPSA" info={DEFINITIONS.tpsa}>
           <Numeric value={formatFixed(p.tpsa, 1)} unit="Å²" />
@@ -125,27 +140,44 @@ function PanelContent({ molecule }: { molecule: Molecule }) {
             ))}
           </ul>
         ) : (
-          <p className="py-2 text-sm text-muted">No synonyms listed on PubChem.</p>
+          <p className="py-2 text-sm text-muted">
+            {molecule.source === "local"
+              ? "None: this structure was built from the SMILES, not looked up."
+              : molecule.source === "cactus"
+                ? "No names listed by NCI CACTUS."
+                : "No synonyms listed on PubChem."}
+          </p>
         )}
       </Section>
 
       <footer className="space-y-0.5 px-4 py-3 text-xs text-muted">
         <p>
           Source:{" "}
-          <a
-            href={compoundPageUrl(molecule.cid)}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 rounded-ctl text-accent hover:underline"
-          >
-            PubChem · CID <span className="font-mono tabular-nums">{molecule.cid}</span>
-            <ExternalLink aria-hidden size={12} />
-            <span className="sr-only">(opens in a new tab)</span>
-          </a>
+          {molecule.source === "local" ? (
+            <span className="text-fg">your browser (OpenChemLib, MMFF94s-minimized)</span>
+          ) : (
+            <a
+              href={molecule.cid !== null ? compoundPageUrl(molecule.cid) : CACTUS_HOME}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 rounded-ctl text-accent hover:underline"
+            >
+              {molecule.cid !== null ? (
+                <>
+                  PubChem · CID <span className="font-mono tabular-nums">{molecule.cid}</span>
+                </>
+              ) : (
+                "NCI CACTUS"
+              )}
+              <ExternalLink aria-hidden size={12} />
+              <span className="sr-only">(opens in a new tab)</span>
+            </a>
+          )}
         </p>
         <p>
-          Retrieved <time dateTime={molecule.retrievedAt.toISOString()}>{formatTimestamp(molecule.retrievedAt)}</time>
-          {molecule.dimension === "2d" ? " · 2D coordinates" : " · 3D conformer"}
+          {molecule.source === "local" ? "Computed" : "Retrieved"}{" "}
+          <time dateTime={molecule.retrievedAt.toISOString()}>{formatTimestamp(molecule.retrievedAt)}</time>
+          {molecule.dimension === "2d" ? " · 2D coordinates" : molecule.source === "pubchem" ? " · 3D conformer" : " · 3D model"}
         </p>
       </footer>
     </article>
