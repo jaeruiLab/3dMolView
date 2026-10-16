@@ -354,6 +354,11 @@ export default function App() {
       </main>
 
       <footer className="px-4 pb-3 text-xs text-muted">
+        {import.meta.env.DEV && import.meta.env.VITE_PUBCHEM_MOCK && (
+          <span className="mr-2 rounded-ctl border border-warn px-1.5 py-0.5 text-fg">
+            Dev: PubChem {import.meta.env.VITE_PUBCHEM_MOCK === "busy" ? "simulated as down" : "mocked with fixtures"}
+          </span>
+        )}
         Data:{" "}
         <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" rel="noreferrer" className="rounded-ctl text-muted underline hover:text-fg">
           PubChem

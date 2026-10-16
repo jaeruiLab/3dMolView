@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:mock": "vite --mode mock",
+    "dev:pubchem-down": "vite --mode pubchem-down",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "fixtures:record": "node scripts/record-fixtures.mjs"
   },
   "dependencies": {
     "3dmol": "^2.5.5",
